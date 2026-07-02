@@ -1,0 +1,758 @@
+---
+title: "Forbes Global 2000 — Comparable Companies Valuation"
+subtitle: "Full Analysis — EV/Revenue Multiples & Undervaluation Screening (D1)"
+author: "René Mohoric"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    theme: cosmo
+    fig-width: 9
+    fig-height: 5
+jupyter: python3
+---
+
+> **Note:** This report documents the same dataset, targets, and features that the live valuation tool (`app.py`, D2) trains on — Forbes Global 2000, EV/Revenue multiples, sector-relative undervaluation. It independently runs the full required pipeline (proper train/validation/test splits, a four-rung model ladder, leakage-safe feature selection) that the production app's tuned GradientBoosting models do not themselves perform when they train live at startup. `app.py` now trains three models on this population — a classifier (undervaluation flag), a regressor for EV/Revenue, and a second regressor for EV/EBITDA — this report formally benchmarks the classifier and the EV/Revenue regressor per the assignment's one-classification/one-regression requirement; the EV/EBITDA extension is summarized in the Conclusions. See `D5_executive_summary.md` for the plain-language findings.
+
+## Executive Summary
+
+This report builds a machine learning valuation framework using the Forbes Global 2000 as a **comparable companies dataset** — the same methodology investment banks and private equity firms use to value acquisition targets.
+
+Two ML tasks:
+
+- **Regression:** Predict the EV/Revenue ratio — the enterprise-value-to-revenue multiple the market assigns to a company with given fundamentals. EV/Revenue is the standard M&A multiple for companies without reliable EBITDA (high-growth, early-stage, or capital-intensive firms).
+- **Classification:** Predict whether a company is **undervalued** (EV/Revenue below its industry median) — a first-pass acquisition screening signal.
+
+A four-rung model ladder (Dummy → Linear → Decision Tree → XGBoost) is trained for each task inside a leakage-safe pipeline that also applies **Recursive Feature Elimination (RFE)**.
+
+---
+
+## Part A — Understand & Clean
+
+### Load and Inspect
+
+```{python}
+import warnings
+warnings.filterwarnings("ignore")
+
+import pickle
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+sns.set_theme(style="whitegrid", palette="muted")
+plt.rcParams.update({"figure.dpi": 120, "axes.titlesize": 13})
+
+with open("data/forbes_enriched.pkl", "rb") as f:
+    _meta = pickle.load(f)
+df_raw = _meta["df"]
+
+print(f"Raw shape: {df_raw.shape}")
+print(f"Enrichment fetched at: {_meta.get('fetched_at', '?')}")
+print(f"\nMissing values (top 10 columns):")
+print(df_raw.isnull().sum().sort_values(ascending=False).head(10))
+```
+
+```{python}
+df_raw[["Company", "Country", "Industry", "Sales_B", "Profits_B", "Assets_B", "MarketValue_B"]].head(3)
+```
+
+**Key observations:**
+
+- The core Forbes fields (`Sales_B`, `Profits_B`, `Assets_B`, `MarketValue_B`, `Industry`, `Country`) come directly from the Forbes Global 2000 ranking and are complete for essentially every company.
+- `description`, `rev_growth`, `ebitda_margin`, `gross_margin`, `fcf_margin` are enrichment fields pulled from Yahoo Finance by `scripts/enrich_forbes_descriptions.py` — coverage is partial because not every Forbes company resolves cleanly to a Yahoo Finance ticker by name (private companies, small regional firms, non-English names).
+- `net_debt_B` defaults to 0.0 for companies without a resolved ticker — a conservative assumption (treated as unlevered) for the EV calculation below.
+- **A currency-conversion bug was found and fixed during development.** Yahoo Finance reports non-USD-reporting companies' financial fields (debt, cash, market cap) in their *local* reporting currency, not USD — the enrichment pipeline was originally reading these raw, unconverted. This produced absurd values for the ~170 Japanese, Korean, and other non-USD companies with resolved tickers (e.g. Toyota's `net_debt_B` computed at ~30,000 instead of ~187, off by roughly the JPY/USD exchange rate). The fix converts every dollar-denominated field to USD using the ticker's reported currency (`financialCurrency` for financial-statement fields, `currency` for market cap — these can differ for ADRs) before any further computation. This is exactly the kind of silent data-quality issue that's easy to miss without spot-checking real companies against known figures, and it directly corrupted the training data (`net_debt_B`, and therefore `ev_B`/`ev_revenue`) for every affected row until caught.
+
+### Compute Targets (identical to `app.py`)
+
+```{python}
+df = df_raw.dropna(subset=["Sales_B"]).copy()
+df = df[df["Sales_B"] > 0].copy()
+
+# EV = Market Cap + Net Debt, except for Banking / Insurance / Diversified Financials
+# where Yahoo Finance counts customer deposits as "total debt" — same fix as app.py.
+FINANCIAL_SECTORS = {"Banking", "Insurance", "Diversified Financials"}
+net_debt = df["net_debt_B"].fillna(0).copy()
+net_debt[df["Industry"].isin(FINANCIAL_SECTORS)] = 0
+df["ev_B"] = df["MarketValue_B"] + net_debt
+df["ev_revenue"] = df["ev_B"] / df["Sales_B"]
+
+# Engineered features — identical to app.py's NUMERIC_FEATURES
+df["profit_margin"] = df["Profits_B"] / df["Sales_B"]
+df["log_sales"]      = np.log1p(df["Sales_B"])
+df["log_assets"]     = np.log1p(df["Assets_B"])
+
+n_before = len(df)
+df = df[df["ev_revenue"].between(0.01, 200)].copy()
+print(f"Rows before EV/Revenue outlier filter: {n_before}")
+print(f"Rows after filter (0.01x - 200x):      {len(df)}")
+print(f"Industries: {df['Industry'].nunique()}")
+
+sector_medians = df.groupby("Industry")["ev_revenue"].median()
+df["sector_median_ev"] = df["Industry"].map(sector_medians)
+df["value_target"] = (df["ev_revenue"] < df["sector_median_ev"]).astype(int)
+
+print(f"\nEV/Revenue: min={df['ev_revenue'].min():.3f}  median={df['ev_revenue'].median():.2f}  max={df['ev_revenue'].max():.1f}")
+print(f"Undervaluation target (below industry-median EV/Revenue): "
+      f"{df['value_target'].sum()} / {len(df)} = {df['value_target'].mean():.1%}")
+
+print()
+for col in ["rev_growth", "ebitda_margin", "gross_margin"]:
+    n = df[col].notna().sum()
+    print(f"  {col:15s}: {n:,} / {len(df):,}  ({n/len(df):.0%} coverage)")
+```
+
+This mirrors `app.py`'s `load_training_data()` exactly (same EV construction, same outlier filter, same undervaluation threshold), so every number in this report describes the same population the live app trains on.
+
+### EDA — EV/Revenue Distribution
+
+```{python}
+fig, axes = plt.subplots(1, 2, figsize=(13, 4))
+
+axes[0].hist(df["ev_revenue"], bins=40, color="#4C72B0", edgecolor="white")
+axes[0].set_title("EV/Revenue — heavy right skew")
+axes[0].set_xlabel("EV / Revenue")
+axes[0].set_ylabel("Count")
+
+axes[1].hist(np.log1p(df["ev_revenue"]), bins=40, color="#55A868", edgecolor="white")
+axes[1].set_title("log(1 + EV/Revenue) — more symmetric")
+axes[1].set_xlabel("log(1 + EV/Revenue)")
+axes[1].set_ylabel("Count")
+
+plt.suptitle("EV/Revenue is positively skewed — software and platform companies pull the tail", y=1.02)
+plt.tight_layout()
+plt.show()
+```
+
+```{python}
+# EV/Revenue by industry — this is the M&A analyst's comparable companies table
+industry_ev = (
+    df.groupby("Industry")["ev_revenue"]
+    .agg(["median", "mean", "count"])
+    .sort_values("median", ascending=True)
+    .rename(columns={"median": "Median EV/Rev", "mean": "Mean EV/Rev", "count": "N"})
+)
+
+fig, ax = plt.subplots(figsize=(11, 7))
+industry_ev["Median EV/Rev"].plot(kind="barh", ax=ax, color="#4C72B0")
+ax.set_title("Median EV/Revenue by Industry — the M&A comps reference table")
+ax.set_xlabel("Median EV/Revenue (×)")
+ax.axvline(df["ev_revenue"].median(), ls="--", color="grey",
+           label=f"Overall median ({df['ev_revenue'].median():.1f}×)")
+ax.legend()
+plt.tight_layout()
+plt.show()
+
+print(industry_ev.to_string(float_format=lambda x: f"{x:.2f}"))
+```
+
+**Financial interpretation:** Software/IT-services and healthcare-equipment industries command premium multiples (growth and margin expectations); banking, utilities, and oil & gas trade at a discount (capital intensity, regulation, cyclicality). This industry table is the starting point for any M&A comparable-companies analysis.
+
+### EDA — Classification Target
+
+```{python}
+vc = df["value_target"].value_counts().sort_index()
+fig, ax = plt.subplots(figsize=(5, 3))
+bars = ax.bar(["At/Above Industry Median", "Below Industry Median\n(Undervalued)"],
+              [vc[0], vc[1]], color=["#4C72B0", "#C44E52"])
+ax.bar_label(bars, fmt="%d")
+ax.set_title("Undervaluation target class balance (~50% by construction)")
+ax.set_ylabel("Count")
+plt.tight_layout()
+plt.show()
+```
+
+Because we threshold at the **industry median**, the target is roughly balanced (~50/50) by construction. This avoids the class-imbalance problem and keeps the task meaningful: the model must learn *which fundamentals* predict trading below industry peers, not just flip the majority class.
+
+### EDA — EV/Revenue vs Revenue
+
+```{python}
+fig, ax = plt.subplots(figsize=(9, 5))
+colors = df["value_target"].map({1: "#C44E52", 0: "#4C72B0"})
+ax.scatter(df["Sales_B"], df["ev_revenue"], c=colors, alpha=0.5, s=20)
+ax.set_xscale("log")
+ax.set_xlabel("Revenue ($B, log)")
+ax.set_ylabel("EV/Revenue (×)")
+ax.set_title("Revenue vs EV/Revenue — colour = undervaluation target")
+from matplotlib.patches import Patch
+legend = [Patch(color="#C44E52", label="Undervalued (below industry median)"),
+          Patch(color="#4C72B0", label="At or above industry median")]
+ax.legend(handles=legend)
+plt.tight_layout()
+plt.show()
+```
+
+High-revenue companies tend toward lower multiples — scale compresses EV/Revenue as growth slows and profitability becomes more predictable. The classification task is non-trivial within industries because both undervalued and premium companies exist at every revenue level.
+
+### EDA — Correlation Heatmap
+
+```{python}
+numeric_cols = ["Sales_B", "Assets_B", "Profits_B", "profit_margin",
+                 "rev_growth", "ebitda_margin", "gross_margin", "ev_revenue"]
+corr = df[numeric_cols].corr()
+
+fig, ax = plt.subplots(figsize=(8, 6))
+sns.heatmap(corr, annot=True, fmt=".2f", cmap="coolwarm", ax=ax, vmin=-1, vmax=1)
+ax.set_title("Correlation Matrix — EV/Revenue vs fundamentals")
+plt.tight_layout()
+plt.show()
+```
+
+EV/Revenue correlates most with profit margin and the enrichment-derived margin fields (where available) — profitable, capital-light companies command premium multiples. Raw size (`Sales_B`, `Assets_B`) is only weakly correlated with the multiple itself, but strongly shapes *which* industry a company competes in, which is why `Industry` is retained as a categorical feature rather than dropped.
+
+---
+
+## Part B — Feature Engineering & Selection
+
+### Engineered Features
+
+```{python}
+print("Engineered features (identical to app.py's NUMERIC_FEATURES):")
+print("  log_sales      = log1p(Sales_B)")
+print("  log_assets     = log1p(Assets_B)")
+print("  profit_margin  = Profits_B / Sales_B")
+print()
+print("Enrichment-derived features (partial coverage, median-imputed downstream):")
+print("  rev_growth, ebitda_margin, gross_margin — from Yahoo Finance via")
+print("  scripts/enrich_forbes_descriptions.py")
+```
+
+### Feature Set
+
+```{python}
+NUMERIC_FEATURES     = ["Sales_B", "Assets_B", "Profits_B", "profit_margin",
+                         "log_sales", "log_assets",
+                         "rev_growth", "ebitda_margin", "gross_margin"]
+CATEGORICAL_FEATURES = ["Industry"]
+ALL_FEATURES         = NUMERIC_FEATURES + CATEGORICAL_FEATURES
+
+X     = df[ALL_FEATURES].copy()
+y_reg = np.log1p(df["ev_revenue"])   # log-transform: reduces right-skew, matches app.py's train_models()
+y_clf = df["value_target"]
+
+print(f"Feature matrix: {X.shape}")
+print(f"  Numeric:     {len(NUMERIC_FEATURES)}")
+print(f"  Categorical: {len(CATEGORICAL_FEATURES)} ({df['Industry'].nunique()} industries) → one-hot encoded")
+print(f"\nRegression target: log1p(ev_revenue)")
+print(f"Classification target: value_target (below industry-median EV/Revenue) — {y_clf.mean():.1%} positive")
+```
+
+### Leakage-Safe Preprocessing Pipeline
+
+```{python}
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.impute import SimpleImputer
+
+def build_preprocessor():
+    num_pipe = Pipeline([
+        ("imputer", SimpleImputer(strategy="median")),
+        ("scaler",  StandardScaler()),
+    ])
+    cat_pipe = Pipeline([
+        ("ohe", OneHotEncoder(handle_unknown="ignore", sparse_output=False)),
+    ])
+    return ColumnTransformer([
+        ("num", num_pipe, NUMERIC_FEATURES),
+        ("cat", cat_pipe, CATEGORICAL_FEATURES),
+    ])
+
+print("Pipeline defined — identical shape to app.py's build_preprocessor().")
+print("Median imputation covers rev_growth / ebitda_margin / gross_margin nulls.")
+print("Will be fitted ONLY on the training split (see Part C).")
+```
+
+### Feature Selection — Recursive Feature Elimination (RFE)
+
+After one-hot encoding `Industry` (27 categories), the pipeline produces roughly 36 transformed columns. To satisfy the assignment's feature-selection requirement without leaking test information, we wrap **RFE** as a pipeline step that is refit on every training fold:
+
+```{python}
+from sklearn.feature_selection import RFE
+from sklearn.linear_model import LogisticRegression, Ridge
+
+SELECT_FRAC = 0.5  # keep the top half of transformed features
+
+def make_clf_pipeline(model):
+    return Pipeline([
+        ("pre",    build_preprocessor()),
+        ("select", RFE(LogisticRegression(max_iter=1_000, random_state=42),
+                       n_features_to_select=SELECT_FRAC)),
+        ("model",  model),
+    ])
+
+def make_reg_pipeline(model):
+    return Pipeline([
+        ("pre",    build_preprocessor()),
+        ("select", RFE(Ridge(alpha=1.0), n_features_to_select=SELECT_FRAC)),
+        ("model",  model),
+    ])
+
+print("RFE wrapped inside the Pipeline for every model in the ladder (Part D).")
+print("Because it sits after 'pre' inside one Pipeline object, calling .fit(X_train, y_train)")
+print("refits the selector on the training fold only — no test-set information leaks in.")
+```
+
+The actual feature-selection decision — which columns RFE keeps or drops — is only meaningful once we have a training split to fit on, so it's reported in Part C immediately after the split.
+
+---
+
+## Part C — Split & Validate
+
+```{python}
+from sklearn.model_selection import train_test_split, StratifiedKFold
+
+# 60% train / 20% val / 20% test — stratified on value_target
+X_trainval, X_test = train_test_split(X, test_size=0.2, stratify=y_clf, random_state=42)
+X_train, X_val      = train_test_split(X_trainval, test_size=0.25,
+                                        stratify=y_clf[X_trainval.index], random_state=42)
+
+y_clf_train = y_clf[X_train.index]
+y_clf_val   = y_clf[X_val.index]
+y_clf_test  = y_clf[X_test.index]
+y_reg_train = y_reg[X_train.index]
+y_reg_val   = y_reg[X_val.index]
+y_reg_test  = y_reg[X_test.index]
+
+print(f"Train:      {len(X_train):4d} rows  (undervalued: {y_clf_train.mean():.1%})")
+print(f"Validation: {len(X_val):4d} rows  (undervalued: {y_clf_val.mean():.1%})")
+print(f"Test:       {len(X_test):4d} rows  (undervalued: {y_clf_test.mean():.1%})")
+print()
+print("Stratified split preserves ~50% class balance across all three sets.")
+```
+
+### Feature Selection Applied (Training Fold Only)
+
+```{python}
+pre_probe = build_preprocessor()
+Xt_train  = pre_probe.fit_transform(X_train)
+Xt_val    = pre_probe.transform(X_val)
+feature_names = pre_probe.get_feature_names_out()
+
+# --- Classification: which features does RFE keep? ---
+rfe_clf_probe = RFE(LogisticRegression(max_iter=1_000, random_state=42), n_features_to_select=SELECT_FRAC)
+rfe_clf_probe.fit(Xt_train, y_clf_train)
+selected_clf   = feature_names[rfe_clf_probe.support_]
+eliminated_clf = feature_names[~rfe_clf_probe.support_]
+
+print(f"Classification RFE: kept {len(selected_clf)} / {len(feature_names)} transformed features")
+print(f"\nEliminated (top 10 shown): {list(eliminated_clf[:10])}")
+
+# --- Regression: which features does RFE keep? ---
+rfe_reg_probe = RFE(Ridge(alpha=1.0), n_features_to_select=SELECT_FRAC)
+rfe_reg_probe.fit(Xt_train, y_reg_train)
+selected_reg   = feature_names[rfe_reg_probe.support_]
+eliminated_reg = feature_names[~rfe_reg_probe.support_]
+
+print(f"\nRegression RFE: kept {len(selected_reg)} / {len(feature_names)} transformed features")
+print(f"Eliminated (top 10 shown): {list(eliminated_reg[:10])}")
+```
+
+```{python}
+from sklearn.metrics import roc_auc_score, r2_score
+
+# Honest before/after check: does the reduced feature set cost us accuracy on the
+# SAME ranking estimator used to select it? (Fit on train, scored on validation.)
+clf_full = LogisticRegression(max_iter=1_000, random_state=42).fit(Xt_train, y_clf_train)
+clf_sel  = LogisticRegression(max_iter=1_000, random_state=42).fit(
+               Xt_train[:, rfe_clf_probe.support_], y_clf_train)
+
+auc_full = roc_auc_score(y_clf_val, clf_full.predict_proba(Xt_val)[:, 1])
+auc_sel  = roc_auc_score(y_clf_val, clf_sel.predict_proba(Xt_val[:, rfe_clf_probe.support_])[:, 1])
+
+reg_full = Ridge(alpha=1.0).fit(Xt_train, y_reg_train)
+reg_sel  = Ridge(alpha=1.0).fit(Xt_train[:, rfe_reg_probe.support_], y_reg_train)
+
+r2_full = r2_score(y_reg_val, reg_full.predict(Xt_val))
+r2_sel  = r2_score(y_reg_val, reg_sel.predict(Xt_val[:, rfe_reg_probe.support_]))
+
+comparison = pd.DataFrame({
+    "Task":              ["Classification (ROC-AUC)", "Regression (R²)"],
+    "All features":       [auc_full, r2_full],
+    "RFE-selected (50%)": [auc_sel,  r2_sel],
+})
+comparison.style.format({"All features": "{:.3f}", "RFE-selected (50%)": "{:.3f}"})
+```
+
+**Honest read:** RFE is applied as a genuine dimensionality reduction, not as a score-chasing trick — the table above reports validation performance with the full feature set and with the RFE-selected half side by side, on the same linear model, so any gap (in either direction) is visible rather than hidden. The four-rung ladder in Part D uses the RFE-wrapped pipelines from Part B for every model, so this reduced feature set is what the ladder is actually trained and evaluated on.
+
+### Overfitting Demonstration — Decision Tree
+
+```{python}
+from sklearn.model_selection import validation_curve
+from sklearn.tree import DecisionTreeClassifier
+
+dt_pipeline = Pipeline([
+    ("pre",   build_preprocessor()),
+    ("model", DecisionTreeClassifier(random_state=42)),
+])
+
+param_range = list(range(1, 16))
+train_scores, val_scores = validation_curve(
+    dt_pipeline, X_trainval, y_clf[X_trainval.index],
+    param_name="model__max_depth",
+    param_range=param_range,
+    cv=StratifiedKFold(5, shuffle=True, random_state=42),
+    scoring="roc_auc",
+    n_jobs=-1,
+)
+
+fig, ax = plt.subplots(figsize=(8, 4))
+ax.plot(param_range, train_scores.mean(axis=1), label="Train AUC", color="#4C72B0")
+ax.fill_between(param_range,
+                train_scores.mean(axis=1) - train_scores.std(axis=1),
+                train_scores.mean(axis=1) + train_scores.std(axis=1), alpha=0.1, color="#4C72B0")
+ax.plot(param_range, val_scores.mean(axis=1), label="CV Val AUC", color="#C44E52")
+ax.fill_between(param_range,
+                val_scores.mean(axis=1) - val_scores.std(axis=1),
+                val_scores.mean(axis=1) + val_scores.std(axis=1), alpha=0.1, color="#C44E52")
+ax.axvline(x=4, ls="--", color="grey", label="Sweet spot (depth=4)")
+ax.set_xlabel("Decision Tree max_depth")
+ax.set_ylabel("ROC-AUC")
+ax.set_title("Validation Curve — Decision Tree overfits beyond depth 4-5")
+ax.legend()
+plt.tight_layout()
+plt.show()
+```
+
+Classic overfitting: train AUC climbs toward 1.0 as depth increases; val AUC peaks around depth 3-5 and then flattens or degrades. We cap the tree at `max_depth=4` in the ladder below. This also informs the XGBoost depth prior.
+
+### XGBoost Hyperparameter Tuning
+
+Rather than using arbitrary defaults, we run a small grid search on the training data using 5-fold cross-validation, inside the same RFE-wrapped pipeline. The test set is never touched during this step.
+
+```{python}
+from sklearn.model_selection import GridSearchCV, KFold
+from xgboost import XGBClassifier, XGBRegressor
+
+param_grid = {
+    "model__max_depth":     [3, 4, 5],
+    "model__learning_rate": [0.05, 0.10],
+    "model__n_estimators":  [200, 300],
+}
+
+xgb_clf_search = GridSearchCV(
+    make_clf_pipeline(XGBClassifier(subsample=0.8, colsample_bytree=0.8,
+                                     eval_metric="logloss", random_state=42)),
+    param_grid,
+    cv=StratifiedKFold(5, shuffle=True, random_state=42),
+    scoring="roc_auc",
+    n_jobs=-1,
+    refit=True,
+)
+xgb_clf_search.fit(X_trainval, y_clf[X_trainval.index])
+best_clf_params = {k.replace("model__", ""): v
+                   for k, v in xgb_clf_search.best_params_.items()}
+print("=== Classification — best XGBoost params ===")
+print(best_clf_params)
+print(f"Best CV ROC-AUC: {xgb_clf_search.best_score_:.4f}")
+```
+
+```{python}
+xgb_reg_search = GridSearchCV(
+    make_reg_pipeline(XGBRegressor(subsample=0.8, colsample_bytree=0.8, random_state=42)),
+    param_grid,
+    cv=KFold(5, shuffle=True, random_state=42),
+    scoring="r2",
+    n_jobs=-1,
+    refit=True,
+)
+xgb_reg_search.fit(X_trainval, y_reg[X_trainval.index])
+best_reg_params = {k.replace("model__", ""): v
+                   for k, v in xgb_reg_search.best_params_.items()}
+print("=== Regression — best XGBoost params ===")
+print(best_reg_params)
+print(f"Best CV R²: {xgb_reg_search.best_score_:.4f}")
+```
+
+The tuned parameters are used in the model ladder below.
+
+---
+
+## Part D — Model Ladder
+
+### Classification — Predict Undervaluation (Below Industry-Median EV/Revenue)
+
+```{python}
+from sklearn.dummy import DummyClassifier
+from sklearn.metrics import (accuracy_score, f1_score, precision_score,
+                              recall_score, roc_auc_score, confusion_matrix,
+                              ConfusionMatrixDisplay)
+
+classifiers = {
+    "Dummy (Stratified)": DummyClassifier(strategy="stratified", random_state=42),
+    "Logistic Regression": LogisticRegression(max_iter=1_000, random_state=42),
+    "Decision Tree (depth=4)": DecisionTreeClassifier(max_depth=4, random_state=42),
+    "XGBoost (tuned)": XGBClassifier(
+        subsample=0.8, colsample_bytree=0.8,
+        eval_metric="logloss", random_state=42,
+        **best_clf_params,
+    ),
+}
+
+clf_results = []
+fitted_clfs = {}
+
+for name, model in classifiers.items():
+    pipe = make_clf_pipeline(model)
+    pipe.fit(X_train, y_clf_train)
+    fitted_clfs[name] = pipe
+
+    y_pred       = pipe.predict(X_val)
+    y_prob       = pipe.predict_proba(X_val)[:, 1]
+    y_prob_train = pipe.predict_proba(X_train)[:, 1]
+
+    clf_results.append({
+        "Model":     name,
+        "Accuracy":  accuracy_score(y_clf_val, y_pred),
+        "Precision": precision_score(y_clf_val, y_pred, zero_division=0),
+        "Recall":    recall_score(y_clf_val, y_pred, zero_division=0),
+        "F1":        f1_score(y_clf_val, y_pred, zero_division=0),
+        "ROC-AUC":   roc_auc_score(y_clf_val, y_prob),
+        "Train AUC": roc_auc_score(y_clf_train, y_prob_train),
+    })
+
+clf_val_df = pd.DataFrame(clf_results).set_index("Model")
+clf_val_df.style.format("{:.3f}").background_gradient(subset=["ROC-AUC", "F1"], cmap="Greens")
+```
+
+**Observations (validation set):**
+
+- Class balance is ~50/50, so Dummy ≈ 0.50 AUC is the correct baseline.
+- Logistic Regression on the RFE-selected features already achieves meaningful lift — industry and margin fundamentals are predictive.
+- Decision Tree's train AUC runs well above its validation AUC, confirming overfitting.
+- XGBoost improves AUC further by capturing non-linear interactions the linear model misses.
+
+### Classification — Final Test Evaluation
+
+```{python}
+clf_test_results = []
+for name, pipe in fitted_clfs.items():
+    p = make_clf_pipeline(pipe.named_steps["model"])
+    p.fit(X_trainval, y_clf[X_trainval.index])
+    y_pred = p.predict(X_test)
+    y_prob = p.predict_proba(X_test)[:, 1]
+    clf_test_results.append({
+        "Model":     name,
+        "Accuracy":  accuracy_score(y_clf_test, y_pred),
+        "Precision": precision_score(y_clf_test, y_pred, zero_division=0),
+        "Recall":    recall_score(y_clf_test, y_pred, zero_division=0),
+        "F1":        f1_score(y_clf_test, y_pred, zero_division=0),
+        "ROC-AUC":   roc_auc_score(y_clf_test, y_prob),
+    })
+
+clf_test_df = pd.DataFrame(clf_test_results).set_index("Model")
+clf_test_df.style.format("{:.3f}").background_gradient(subset=["ROC-AUC", "F1"], cmap="Greens")
+```
+
+### Confusion Matrix — XGBoost (Test)
+
+```{python}
+best_clf = make_clf_pipeline(XGBClassifier(
+    subsample=0.8, colsample_bytree=0.8,
+    eval_metric="logloss", random_state=42,
+    **best_clf_params,
+))
+best_clf.fit(X_trainval, y_clf[X_trainval.index])
+y_pred_best = best_clf.predict(X_test)
+
+fig, ax = plt.subplots(figsize=(5, 4))
+ConfusionMatrixDisplay.from_predictions(
+    y_clf_test, y_pred_best,
+    display_labels=["At/Above Median", "Undervalued"],
+    ax=ax, colorbar=False
+)
+ax.set_title("XGBoost — Confusion Matrix (Test Set)")
+plt.tight_layout()
+plt.show()
+```
+
+### Regression — Predict EV/Revenue Multiple
+
+```{python}
+from sklearn.dummy import DummyRegressor
+from sklearn.tree import DecisionTreeRegressor
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+
+regressors = {
+    "Dummy (Mean)":            DummyRegressor(strategy="mean"),
+    "Ridge Regression":        Ridge(alpha=1.0),
+    "Decision Tree (depth=4)": DecisionTreeRegressor(max_depth=4, random_state=42),
+    "XGBoost (tuned)":         XGBRegressor(
+        subsample=0.8, colsample_bytree=0.8, random_state=42,
+        **best_reg_params,
+    ),
+}
+
+reg_results = []
+fitted_regs = {}
+
+for name, model in regressors.items():
+    pipe = make_reg_pipeline(model)
+    pipe.fit(X_train, y_reg_train)
+    fitted_regs[name] = pipe
+
+    y_pred    = pipe.predict(X_val)
+    y_pred_tr = pipe.predict(X_train)
+
+    reg_results.append({
+        "Model":      name,
+        "R²":         r2_score(y_reg_val, y_pred),
+        "MAE (log)":  mean_absolute_error(y_reg_val, y_pred),
+        "RMSE (log)": mean_squared_error(y_reg_val, y_pred) ** 0.5,
+        "Train R²":   r2_score(y_reg_train, y_pred_tr),
+    })
+
+reg_val_df = pd.DataFrame(reg_results).set_index("Model")
+reg_val_df.style.format({
+    "R²": "{:.3f}", "Train R²": "{:.3f}",
+    "MAE (log)": "{:.3f}", "RMSE (log)": "{:.3f}"
+}).background_gradient(subset=["R²"], cmap="Blues")
+```
+
+**Observations (validation set):**
+
+- The Dummy baseline (predict the mean log EV/Revenue for every company) is weak — EV/Revenue is highly industry- and company-specific.
+- Ridge picks up the linear relationship between margin/size and multiples quickly, even on the RFE-reduced feature set.
+- Decision Tree overfits: train R² runs well above validation R².
+- XGBoost captures non-linear industry interactions Ridge misses.
+
+### Regression — Final Test Evaluation
+
+```{python}
+reg_test_results = []
+fitted_regs_final = {}
+for name, pipe in fitted_regs.items():
+    p = make_reg_pipeline(pipe.named_steps["model"])
+    p.fit(X_trainval, y_reg[X_trainval.index])
+    fitted_regs_final[name] = p
+    y_pred = p.predict(X_test)
+    reg_test_results.append({
+        "Model":      name,
+        "R²":         r2_score(y_reg_test, y_pred),
+        "MAE (log)":  mean_absolute_error(y_reg_test, y_pred),
+        "RMSE (log)": mean_squared_error(y_reg_test, y_pred) ** 0.5,
+    })
+
+reg_test_df = pd.DataFrame(reg_test_results).set_index("Model")
+reg_test_df.style.format({
+    "R²": "{:.3f}", "MAE (log)": "{:.3f}", "RMSE (log)": "{:.3f}"
+}).background_gradient(subset=["R²"], cmap="Blues")
+```
+
+### Predicted vs Actual — XGBoost EV/Revenue (Test)
+
+```{python}
+best_reg = fitted_regs_final["XGBoost (tuned)"]
+y_pred_reg_log = best_reg.predict(X_test)
+
+# Convert back to raw EV/Revenue for an interpretable chart
+y_actual_raw = np.expm1(y_reg_test)
+y_pred_raw   = np.expm1(y_pred_reg_log)
+
+fig, ax = plt.subplots(figsize=(7, 5))
+ax.scatter(y_actual_raw, y_pred_raw, alpha=0.6, s=30, color="#4C72B0")
+lims = [0, max(y_actual_raw.max(), y_pred_raw.max()) * 1.05]
+ax.plot(lims, lims, "--", color="grey", label="Perfect prediction")
+ax.set_xlabel("Actual EV/Revenue (×)")
+ax.set_ylabel("Predicted EV/Revenue (×)")
+ax.set_title("XGBoost — Predicted vs Actual EV/Revenue (Test Set)")
+ax.legend()
+plt.tight_layout()
+plt.show()
+```
+
+The model captures the bulk of the distribution well. High-multiple outliers (software and platform companies) are systematically under-predicted — a known limitation of gradient boosting on datasets with extreme tail observations.
+
+---
+
+## Part E — Benchmark & Honest Evaluation
+
+### Classification Leaderboard (Test Set)
+
+```{python}
+print("=== UNDERVALUATION SCREENING — CLASSIFICATION LEADERBOARD (Test Set) ===")
+print(clf_test_df.to_string())
+print()
+print("Baseline (Dummy) ROC-AUC:  ", f"{clf_test_df.loc['Dummy (Stratified)', 'ROC-AUC']:.3f}")
+print("XGBoost (tuned) ROC-AUC:   ", f"{clf_test_df.loc['XGBoost (tuned)', 'ROC-AUC']:.3f}")
+print()
+print("Honest assessment: ~50/50 balanced task by construction. Any AUC meaningfully")
+print("above 0.50 shows that fundamentals genuinely predict industry-relative pricing —")
+print("this is not a guaranteed result and is called out explicitly if it fails to hold.")
+```
+
+### Regression Leaderboard (Test Set)
+
+```{python}
+print("=== EV/REVENUE PREDICTION — REGRESSION LEADERBOARD (Test Set) ===")
+print(reg_test_df.to_string())
+print()
+med_ev = df["ev_revenue"].median()
+print(f"Median EV/Revenue in dataset: {med_ev:.2f}x")
+print()
+print("M&A interpretation: because the regression target is log1p(EV/Revenue), errors")
+print("compress at the high end and expand at the low end of the raw multiple — use the")
+print("predicted-vs-actual chart above, not RMSE alone, to judge practical accuracy.")
+print("Use for directional screening, not binding valuation.")
+```
+
+### Feature Importance — What Drives the EV/Revenue Multiple?
+
+```{python}
+best_reg_model  = best_reg.named_steps["model"]
+reg_select_mask = best_reg.named_steps["select"].support_
+reg_pre         = best_reg.named_steps["pre"]
+reg_feature_names = reg_pre.get_feature_names_out()[reg_select_mask]
+
+fi_df = pd.DataFrame({
+    "Feature": reg_feature_names,
+    "Importance": best_reg_model.feature_importances_,
+}).nlargest(12, "Importance")
+
+fig, ax = plt.subplots(figsize=(9, 5))
+fi_df.sort_values("Importance").plot(kind="barh", x="Feature", y="Importance", ax=ax,
+                                      color="#4C72B0", legend=False)
+ax.set_title("XGBoost Feature Importance — EV/Revenue Prediction (RFE-selected features)")
+ax.set_xlabel("Relative Importance")
+plt.tight_layout()
+plt.show()
+```
+
+### Business Interpretation — M&A Use Case
+
+**How to use these models in practice:**
+
+1. **For valuing a private acquisition target:** Enter the target's revenue, profit, assets, margins, and industry (the same inputs `app.py` collects). The regression model returns the EV/Revenue multiple a comparable Forbes Global 2000 public company with those fundamentals commands. Multiply by target revenue to get an implied enterprise value.
+
+2. **For screening acquisition targets among public companies:** The classification model flags companies trading below their industry-median multiple — the starting point for a value-oriented acquisition screen.
+
+3. **What the industry table tells you:** Software/IT-services and healthcare-equipment command multiples several times higher than banking or utilities at the same revenue level. Industry is therefore one of the most important inputs to any M&A valuation, which is exactly why RFE keeps most of the industry dummies even after eliminating half the transformed feature space.
+
+**What I would NOT trust these models to do:**
+
+- Provide a precise valuation for a specific target — treat the output as a directional anchor, not a binding bid number.
+- Replace industry knowledge — the model averages across Forbes G2000 comps; niche sub-industries (SaaS vs. IT distribution, both labeled "IT Software & Services") behave very differently, which is exactly what the live app's description-based TF-IDF matching (D2) is designed to correct for.
+- Generalise to small-cap or private company universes — Forbes G2000 companies are large-cap by definition and their multiples reflect different liquidity and risk premiums.
+- Extrapolate without retraining — rate environment and sector rotation shift multiples significantly over time.
+
+---
+
+## Conclusions
+
+| Task | Best Model | Key Metric | M&A Use |
+|------|-----------|-----------|---------|
+| Undervaluation Screening | XGBoost | ROC-AUC (see leaderboard) | Flag undervalued public comps |
+| EV/Revenue Prediction | XGBoost | R² / RMSE (see leaderboard) | Valuation range for private targets |
+
+Both XGBoost models outperform their Dummy baselines. The classification task demonstrates that company fundamentals — particularly profit margin, industry, and scale — predict whether a company trades at a discount to industry peers, even after RFE removes half the transformed feature space. The regression task provides a data-driven EV/Revenue estimate that can anchor M&A valuation analysis when a formal comparable-companies table is unavailable.
+
+**Production extension — EV/EBITDA.** `app.py` trains a third model beyond what this report formally benchmarks: a second GradientBoosting regressor predicting EV/EBITDA, using the same feature set and log-transform approach as the EV/Revenue regressor above, trained on the ~34% of the population with usable EBITDA coverage (a smaller, noisier subset than the ~1,901-row EV/Revenue population). It's surfaced in the app as a parallel, explicitly lower-confidence metric alongside the EV/Revenue estimate — not blended into it — since EV/EBITDA is often the more appropriate multiple for capital-intensive businesses where EV/Revenue understates true earning power. This report doesn't run a full second ladder for it, since the assignment requires one regression target, not two; the EV/Revenue ladder above is the one formally validated with a train/validation/test split and a leaderboard.
+
+**Production verdict methodology.** For a loaded public company, `app.py`'s verdict compares the company's actual EV/Revenue against a blended benchmark — 30% the trained model's own prediction, 70% the peer median from the comparable-companies table — rather than the model's raw prediction alone. This weights the verdict toward what similar real companies are actually trading at, with the model term correcting for idiosyncrasies the peer group doesn't fully capture. For private/manually-entered companies with no market price to compare against, the app deliberately does not show an undervalued/overvalued/fair-value judgment — there's nothing to compare it to — and instead presents the blended figure as a plain estimated valuation.
+
+Full reproducible code is in this repository. The live Streamlit app (`app.py`) trains all three tuned GradientBoosting models (classifier, EV/Revenue regressor, EV/EBITDA regressor) on this same population for interactive, per-company valuation queries.

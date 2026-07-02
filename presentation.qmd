@@ -1,0 +1,350 @@
+---
+title: "Forbes Global 2000 — Comparable Companies Valuation"
+subtitle: "Machine Learning EV/Revenue Multiples · Live Company Search · Description-Based Comps (D4)"
+author: "René Mohoric"
+date: today
+format:
+  revealjs:
+    theme: simple
+    slide-number: true
+    transition: fade
+    code-fold: true
+    fig-width: 8
+    fig-height: 4
+jupyter: python3
+---
+
+## The Question
+
+**Comparable companies valuation — automated and scalable:**
+
+::: {.incremental}
+- 💼 **Regression:** Given a company's revenue, profit, assets, industry, and margins — what EV/Revenue multiple does the market assign? *(Implied enterprise value for any company, public or private)*
+- 🎯 **Classification:** Is this company trading *below* its industry's median multiple? *(Undervaluation screen)*
+:::
+
+::: {.fragment}
+**Dataset:** Forbes Global 2000, 2026 edition — 1,901 public companies across 27 industries (after removing EV/Revenue outliers).
+Used as a **comps universe** — the same methodology investment banks use to value acquisition targets.
+:::
+
+---
+
+## Why It Matters
+
+::: columns
+::: {.column width="50%"}
+**Regression — Revenue Multiple**
+
+- Private equity and corporate buyers need to value private targets
+- No public price → use comparable public companies
+- Model output: "A company with this profile trades at **~2.5× revenue**"
+- Multiply by target's revenue → implied enterprise value range
+:::
+
+::: {.column width="50%"}
+**Classification — Undervaluation Screen**
+
+- Which Forbes Global 2000 companies trade *below* their industry peers?
+- These are the cheapest acquisitions on an EV/Revenue basis
+- Model output: probability that fundamentals imply a below-median multiple
+- First-pass acquisition screen before detailed diligence
+:::
+:::
+
+---
+
+## The Data at a Glance
+
+```{python}
+#| echo: false
+import warnings; warnings.filterwarnings("ignore")
+import pickle
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+sns.set_theme(style="whitegrid")
+
+with open("data/forbes_enriched.pkl", "rb") as f:
+    _meta = pickle.load(f)
+df = _meta["df"]
+df = df.dropna(subset=["Sales_B"]).copy()
+df = df[df["Sales_B"] > 0].copy()
+
+FINANCIAL_SECTORS = {"Banking", "Insurance", "Diversified Financials"}
+net_debt = df["net_debt_B"].fillna(0).copy()
+net_debt[df["Industry"].isin(FINANCIAL_SECTORS)] = 0
+df["ev_B"] = df["MarketValue_B"] + net_debt
+df["ev_revenue"] = df["ev_B"] / df["Sales_B"]
+df["profit_margin"] = df["Profits_B"] / df["Sales_B"]
+df["log_sales"]  = np.log1p(df["Sales_B"])
+df["log_assets"] = np.log1p(df["Assets_B"])
+df = df[df["ev_revenue"].between(0.01, 200)].copy()
+
+sector_medians = df.groupby("Industry")["ev_revenue"].median()
+df["sector_median_ev"] = df["Industry"].map(sector_medians)
+df["value_target"] = (df["ev_revenue"] < df["sector_median_ev"]).astype(int)
+
+fig, axes = plt.subplots(1, 2, figsize=(10, 3.5))
+axes[0].hist(df["ev_revenue"], bins=35, color="#4C72B0", edgecolor="white")
+axes[0].set_title("EV/Revenue — right-skewed"); axes[0].set_xlabel("EV/Revenue (×)")
+vc = df["value_target"].value_counts()
+axes[1].bar(["At/Above Median", "Undervalued\n(Below Median)"], [vc[0], vc[1]],
+            color=["#4C72B0", "#C44E52"])
+axes[1].set_title("Classification target: ~50/50 balanced")
+for ax in axes: ax.set_ylabel("Count")
+plt.tight_layout(); plt.show()
+```
+
+- **1,901 rows**, 27 industries — same population `app.py` trains on live
+- Classification balanced by construction: threshold at **industry median**
+
+---
+
+## The Industry Comps Table
+
+```{python}
+#| echo: false
+industry_ev = df.groupby("Industry")["ev_revenue"].median().sort_values(ascending=True)
+fig, ax = plt.subplots(figsize=(10, 5.5))
+industry_ev.plot(kind="barh", ax=ax, color="#4C72B0")
+ax.axvline(df["ev_revenue"].median(), ls="--", color="grey",
+           label=f"Overall median ({df['ev_revenue'].median():.1f}×)")
+ax.set_xlabel("Median EV/Revenue (×)"); ax.set_title("Industry Median Revenue Multiples — the M&A comps reference")
+ax.legend(); plt.tight_layout(); plt.show()
+```
+
+**Semiconductors (~17×) and Software (~5.5×) command the richest multiples**; Food Markets, Trading, and Insurance trade near or below 1×. Industry is the most important M&A valuation input after margin quality.
+
+---
+
+## What We Built: The Pipeline
+
+```{python}
+#| echo: false
+import matplotlib.patches as mpatches
+fig, ax = plt.subplots(figsize=(11, 2.5))
+ax.axis("off")
+steps = ["Forbes G2000\n+ YF enrichment", "Target Engineering\n(EV/Revenue)",
+         "ColumnTransformer\n(fit on train only)", "RFE Feature\nSelection",
+         "Model\nLadder", "Test\nEvaluation"]
+colors = ["#AED6F1", "#ABEBC6", "#F9E79F", "#F8C471", "#F1948A", "#BB8FCE"]
+for i, (s, c) in enumerate(zip(steps, colors)):
+    ax.add_patch(mpatches.FancyBboxPatch((i*1.8, 0.2), 1.6, 0.6,
+                 boxstyle="round,pad=0.05", facecolor=c, edgecolor="grey"))
+    ax.text(i*1.8+0.8, 0.5, s, ha="center", va="center", fontsize=8.5, fontweight="bold")
+    if i < len(steps)-1:
+        ax.annotate("", xy=((i+1)*1.8, 0.5), xytext=(i*1.8+1.6, 0.5),
+                    arrowprops=dict(arrowstyle="->"))
+ax.set_xlim(-0.2, 10.8); ax.set_ylim(0, 1)
+plt.tight_layout(); plt.show()
+```
+
+::: {.callout-important}
+**No leakage:** `MarketValue_B`/`net_debt_B` compute the target and are excluded from features. Scaler, one-hot encoder, and RFE selector all fit inside the Pipeline on the training split only.
+:::
+
+---
+
+## The Model Ladder
+
+Four rungs per task — simple to complex:
+
+| Rung | Regression (EV/Rev ×) | Classification (Undervaluation) |
+|------|------------------------|----------------------------------|
+| 1. Baseline | DummyRegressor (mean) | DummyClassifier |
+| 2. Linear | Ridge Regression | Logistic Regression |
+| 3. Tree | Decision Tree | Decision Tree |
+| 4. Ensemble | **XGBoost** | **XGBoost** |
+
+::: {.fragment}
+Every rung runs through the same RFE-selected feature set (top half of transformed columns) — a fair, apples-to-apples comparison.
+:::
+
+---
+
+## Overfitting — Live Evidence
+
+```{python}
+#| echo: false
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.impute import SimpleImputer
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.model_selection import validation_curve, StratifiedKFold
+
+NUMERIC = ["Sales_B", "Assets_B", "Profits_B", "profit_margin",
+           "log_sales", "log_assets", "rev_growth", "ebitda_margin", "gross_margin"]
+CATEGORICAL = ["Industry"]
+
+X = df[NUMERIC + CATEGORICAL]
+y_clf = df["value_target"]
+
+def build_pre():
+    return ColumnTransformer([
+        ("num", Pipeline([("imp", SimpleImputer(strategy="median")),
+                          ("sc", StandardScaler())]), NUMERIC),
+        ("cat", Pipeline([("ohe", OneHotEncoder(handle_unknown="ignore",
+                                                sparse_output=False))]), CATEGORICAL),
+    ])
+
+pipe = Pipeline([("pre", build_pre()), ("model", DecisionTreeClassifier(random_state=42))])
+r = list(range(1, 16))
+tr, vl = validation_curve(pipe, X, y_clf, param_name="model__max_depth",
+                           param_range=r, cv=StratifiedKFold(5, shuffle=True, random_state=42),
+                           scoring="roc_auc", n_jobs=-1)
+fig, ax = plt.subplots(figsize=(8, 3.5))
+ax.plot(r, tr.mean(1), label="Train AUC", color="#4C72B0")
+ax.plot(r, vl.mean(1), label="Val AUC", color="#C44E52")
+ax.fill_between(r, vl.mean(1)-vl.std(1), vl.mean(1)+vl.std(1), alpha=0.15, color="#C44E52")
+ax.axvline(4, ls="--", color="grey", label="depth = 4")
+ax.set_xlabel("max_depth"); ax.set_ylabel("ROC-AUC")
+ax.set_title("Decision Tree: train AUC climbs, val AUC peaks around depth 4")
+ax.legend(); plt.tight_layout(); plt.show()
+```
+
+---
+
+## Results — Classification (Test Set)
+
+```{python}
+#| echo: false
+from sklearn.feature_selection import RFE
+from sklearn.dummy import DummyClassifier
+from sklearn.linear_model import LogisticRegression, Ridge
+from sklearn.metrics import roc_auc_score, f1_score, accuracy_score
+from sklearn.model_selection import train_test_split
+from xgboost import XGBClassifier
+
+X_tr, X_te = train_test_split(X, test_size=0.2, stratify=y_clf, random_state=42)
+y_tr, y_te = y_clf[X_tr.index], y_clf[X_te.index]
+
+def make_clf_pipe(model):
+    return Pipeline([
+        ("pre", build_pre()),
+        ("select", RFE(LogisticRegression(max_iter=1000, random_state=42), n_features_to_select=0.5)),
+        ("model", model),
+    ])
+
+models = {
+    "Dummy": DummyClassifier(strategy="stratified", random_state=42),
+    "Logistic Regression": LogisticRegression(max_iter=1000, random_state=42),
+    "Decision Tree": DecisionTreeClassifier(max_depth=4, random_state=42),
+    "XGBoost": XGBClassifier(n_estimators=300, max_depth=3, learning_rate=0.05,
+                              subsample=0.8, colsample_bytree=0.8,
+                              eval_metric="logloss", random_state=42),
+}
+rows = []
+for name, m in models.items():
+    p = make_clf_pipe(m)
+    p.fit(X_tr, y_tr)
+    yp = p.predict(X_te); ypr = p.predict_proba(X_te)[:,1]
+    rows.append({"Model": name, "Accuracy": accuracy_score(y_te, yp),
+                 "F1": f1_score(y_te, yp, zero_division=0),
+                 "ROC-AUC": roc_auc_score(y_te, ypr)})
+res = pd.DataFrame(rows).set_index("Model")
+print(res.to_string(float_format=lambda x: f"{x:.3f}"))
+```
+
+**Dummy baseline ≈ 0.48 AUC** (balanced task). XGBoost reaches ~0.77 AUC, learning non-linear interactions between margin, industry, and scale that linear models partially miss.
+
+---
+
+## Results — Regression (Test Set)
+
+```{python}
+#| echo: false
+from sklearn.dummy import DummyRegressor
+from sklearn.tree import DecisionTreeRegressor
+from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
+from xgboost import XGBRegressor
+
+y_reg = np.log1p(df["ev_revenue"])
+y_reg_tr, y_reg_te = y_reg[X_tr.index], y_reg[X_te.index]
+
+def make_reg_pipe(model):
+    return Pipeline([
+        ("pre", build_pre()),
+        ("select", RFE(Ridge(alpha=1.0), n_features_to_select=0.5)),
+        ("model", model),
+    ])
+
+reg_models = {
+    "Dummy (Mean)": DummyRegressor(strategy="mean"),
+    "Ridge": Ridge(alpha=1.0),
+    "Decision Tree": DecisionTreeRegressor(max_depth=4, random_state=42),
+    "XGBoost": XGBRegressor(n_estimators=200, max_depth=3, learning_rate=0.05,
+                             subsample=0.8, colsample_bytree=0.8, random_state=42),
+}
+rrows = []
+for name, m in reg_models.items():
+    p = make_reg_pipe(m)
+    p.fit(X_tr, y_reg_tr)
+    yp = p.predict(X_te)
+    rrows.append({"Model": name, "R²": r2_score(y_reg_te, yp),
+                  "MAE (log)": mean_absolute_error(y_reg_te, yp),
+                  "RMSE (log)": mean_squared_error(y_reg_te, yp)**0.5})
+rres = pd.DataFrame(rrows).set_index("Model")
+print(rres.to_string(float_format=lambda x: f"{x:.2f}"))
+```
+
+Target is `log1p(EV/Revenue)` — reduces the right-skew that a raw multiple has. XGBoost's R² gain over Ridge here is real but modest: industry and margin already capture most of the signal a linear model can extract.
+
+---
+
+## What Drives the Multiple?
+
+```{python}
+#| echo: false
+best_r = make_reg_pipe(XGBRegressor(n_estimators=200, max_depth=3,
+                    learning_rate=0.05, subsample=0.8, colsample_bytree=0.8, random_state=42))
+best_r.fit(X_tr, y_reg_tr)
+select_mask = best_r.named_steps["select"].support_
+fn = best_r.named_steps["pre"].get_feature_names_out()[select_mask]
+fi = pd.DataFrame({"Feature": fn, "Importance": best_r.named_steps["model"].feature_importances_}).nlargest(8, "Importance")
+fig, ax = plt.subplots(figsize=(8, 3.5))
+fi.sort_values("Importance").plot(kind="barh", x="Feature", y="Importance", ax=ax,
+                                   color="#4C72B0", legend=False)
+ax.set_title("Top 8 Features — EV/Revenue Model (RFE-selected)"); ax.set_xlabel("Relative Importance")
+plt.tight_layout(); plt.show()
+```
+
+**Industry and scale dominate.** RFE eliminates the raw `Sales_B`/`Assets_B` columns in favour of their log-transformed versions — markets pay premiums for industry exposure and margin quality, the same factors M&A buyers pay up for.
+
+---
+
+## Live App
+
+**Forbes Global 2000 Comparable Companies Tool** — run locally today via `streamlit run app.py`
+
+- Enter: any company's revenue, profit, assets, industry, or search by ticker for a live Yahoo Finance lookup — or snapshot a manual entry as a loaded company, for private/unlisted firms
+- Get: predicted EV/Revenue multiple + implied enterprise value + an undervalued/overvalued/fair-value verdict for public companies (blended 30% model / 70% peer median) — or a plain estimated valuation, with no market to compare against, for private/manual entries
+- Shows: industry comps table + the 20 closest comparable companies, refined by business-description similarity; downloadable as a full Excel report
+
+::: {.callout-note}
+Model trains in-process at app startup (~2 seconds) from `data/forbes_enriched.pkl` — no serialized model files. Not yet deployed to a public URL.
+:::
+
+---
+
+## Honest Takeaways
+
+::: {.incremental}
+1. **Industry is the dominant M&A valuation variable.** Semiconductors and Software command 5-17× what Food Markets or Insurance do at the same revenue.
+2. **Profit margin and scale predict who gets premium multiples** within an industry — RFE keeps the log-transformed size features and drops their raw duplicates.
+3. **XGBoost beats linear models on both tasks, but the regression gain is modest** (R² 0.25 vs. Ridge's 0.21) — most of the signal is already linear once industry is one-hot encoded.
+4. **Use for directional screening, not binding valuation.** EV/Revenue is trained in log-space precisely because the raw multiple is too skewed for a single RMSE number to be trustworthy on its own.
+5. **This is a 2026 single-year snapshot.** Rate environment, sector rotation, and macro conditions shift multiples substantially — retrain periodically.
+:::
+
+---
+
+## Thank You
+
+**Repository:** local project (`MADA/`) — see `README.md` for setup
+
+**Full analysis:** `analysis.qmd` → rendered HTML
+**Live app:** `streamlit run app.py`
+**Contact:** rene.mohoric@gmail.com
